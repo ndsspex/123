@@ -1,4 +1,4 @@
-name: Build Moonlight webOS 26 Elite Series 2 patch
+name: Build Moonlight Elite 2 SDL-owned FD experiment
 
 on:
   push:
@@ -30,6 +30,151 @@ jobs:
           grep -q 'EVIOCGRAB' src/app/platform/webos/gamepad_grab_webos.c
           grep -qi '0x0b22' src/app/platform/webos/gamepad_grab_webos.c
           echo "Verified patched source: $(git rev-parse HEAD)"
+
+      - name: Experimental fix - grab SDL-owned FD rather than new FD
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > src/app/platform/webos/gamepad_grab_webos.c <<'ELITE2_SOURCE'
+          #include "gamepad_grab_webos.h"
+          #include <SDL.h>
+          #include <dirent.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/input.h>
+          #include <stdbool.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <unistd.h>
+          
+          /* Experiment: EVIOCGRAB on an FD already owned by SDL's evdev input backend.
+           * Do not open a separate /dev/input/eventX FD: that starves SDL of events.
+           * Because an evdev grab belongs to the open client, calling ioctl on SDL's
+           * existing FD should allow SDL to continue reading while excluding LG webOS.
+           */
+          #define MAX_GRABS 32
+          
+          typedef struct {
+              int fd;
+              dev_t dev;
+              ino_t ino;
+          } OwnedGrab;
+          
+          static OwnedGrab grabs[MAX_GRABS];
+          static size_t grab_count = 0;
+          static Uint32 next_scan = 0;
+          
+          static bool still_same_fd(const OwnedGrab *g) {
+              struct stat st;
+              return fstat(g->fd, &st) == 0 && st.st_dev == g->dev && st.st_ino == g->ino;
+          }
+          
+          static void release_all(void) {
+              for (size_t i = 0; i < grab_count; ++i) {
+                  if (still_same_fd(&grabs[i])) {
+                      if (ioctl(grabs[i].fd, EVIOCGRAB, 0) == 0) {
+                          SDL_LogInfo(SDL_LOG_CATEGORY_INPUT,
+                                      "Elite2 grab released on existing SDL FD %d", grabs[i].fd);
+                      }
+                  }
+              }
+              grab_count = 0;
+              next_scan = 0;
+          }
+          
+          static bool already_grabbed_fd(int fd) {
+              for (size_t i = 0; i < grab_count; ++i) {
+                  if (grabs[i].fd == fd && still_same_fd(&grabs[i])) {
+                      return true;
+                  }
+              }
+              return false;
+          }
+          
+          void webos_gamepad_grab_update(bool streaming) {
+              if (!streaming) {
+                  release_all();
+                  return;
+              }
+          
+              Uint32 now = SDL_GetTicks();
+              if (next_scan && !SDL_TICKS_PASSED(now, next_scan)) {
+                  return;
+              }
+              next_scan = now + 3000;
+          
+              /* Drop stale registrations when SDL closes/reopens a controller. */
+              size_t keep = 0;
+              for (size_t i = 0; i < grab_count; ++i) {
+                  if (still_same_fd(&grabs[i])) {
+                      grabs[keep++] = grabs[i];
+                  }
+              }
+              grab_count = keep;
+          
+              DIR *dir = opendir("/proc/self/fd");
+              if (!dir) {
+                  SDL_LogWarn(SDL_LOG_CATEGORY_INPUT,
+                              "Elite2 cannot enumerate own FDs (errno=%d)", errno);
+                  return;
+              }
+          
+              struct dirent *ent;
+              while ((ent = readdir(dir)) != NULL && grab_count < MAX_GRABS) {
+                  char *end = NULL;
+                  long n = strtol(ent->d_name, &end, 10);
+                  if (!end || *end != '\0' || n <= 2 || n > 1048575) {
+                      continue;
+                  }
+                  int fd = (int)n;
+                  if (already_grabbed_fd(fd)) {
+                      continue;
+                  }
+                  char fd_link[64], path[256];
+                  snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", fd);
+                  ssize_t size = readlink(fd_link, path, sizeof(path) - 1);
+                  if (size < 0) {
+                      continue;
+                  }
+                  path[size] = '\0';
+                  if (strncmp(path, "/dev/input/event", strlen("/dev/input/event")) != 0) {
+                      continue;
+                  }
+                  struct input_id id;
+                  if (ioctl(fd, EVIOCGID, &id) != 0 ||
+                      id.vendor != 0x045e || id.product != 0x0b22) {
+                      continue;
+                  }
+                  struct stat st;
+                  if (fstat(fd, &st) != 0) {
+                      continue;
+                  }
+          
+                  /* CRITICAL: fd was ALREADY open before we searched. Do not open(path). */
+                  if (ioctl(fd, EVIOCGRAB, 1) == 0) {
+                      grabs[grab_count++] = (OwnedGrab){ .fd = fd,
+                                                        .dev = st.st_dev,
+                                                        .ino = st.st_ino };
+                      SDL_LogInfo(SDL_LOG_CATEGORY_INPUT,
+                                  "Elite2 SDL-owned FD grabbed: fd=%d path=%s", fd, path);
+                  } else {
+                      SDL_LogWarn(SDL_LOG_CATEGORY_INPUT,
+                                  "Elite2 grab failed on fd=%d errno=%d", fd, errno);
+                  }
+              }
+              closedir(dir);
+          }
+          ELITE2_SOURCE
+          grep -q 'Elite2 SDL-owned FD grabbed' src/app/platform/webos/gamepad_grab_webos.c
+          if grep -E '^ *int fd = open\(' src/app/platform/webos/gamepad_grab_webos.c; then
+            echo 'FAIL: standalone evdev open must not occur'
+            exit 1
+          fi
+          echo 'FD-aware patch staged; controller behavior requires LG G5 test.'
 
       - name: Install build tools
         shell: bash
@@ -100,7 +245,7 @@ jobs:
       - name: Upload finished installable package
         uses: actions/upload-artifact@v4
         with:
-          name: Moonlight-Elite2-webOS26-IPK
+          name: Moonlight-Elite2-SDL-FD-Experiment-IPK
           path: ipk-output/
           if-no-files-found: error
           retention-days: 7
