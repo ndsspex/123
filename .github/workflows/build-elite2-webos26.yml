@@ -1,0 +1,87 @@
+name: Build Moonlight webOS 26 Elite Series 2 patch
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact community patch and submodules
+        uses: actions/checkout@v4
+        with:
+          repository: Chaeben/moonlight-tv
+          ref: e255788dcd896776164570f3bbc3d4086bcfa1ea
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify exact source and Elite Series 2 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "e255788dcd896776164570f3bbc3d4086bcfa1ea"
+          test -f src/app/platform/webos/gamepad_grab_webos.c
+          grep -q 'EVIOCGRAB' src/app/platform/webos/gamepad_grab_webos.c
+          grep -qi '0x0b22' src/app/platform/webos/gamepad_grab_webos.c
+          echo "Verified patched source: $(git rev-parse HEAD)"
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential cmake pkg-config git curl ca-certificates \
+            gawk xz-utils unzip autoconf automake libtool gettext
+
+      - name: Download and relocate webOS ARM SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/moonlight-sdk"
+          curl -fL --retry 3 \
+            'https://github.com/openlgtv/buildroot-nc4/releases/download/webos-a38c582/arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz' \
+            -o "$RUNNER_TEMP/moonlight-sdk/sdk.tar.gz"
+          tar -xzf "$RUNNER_TEMP/moonlight-sdk/sdk.tar.gz" -C "$RUNNER_TEMP/moonlight-sdk"
+          sdk="$RUNNER_TEMP/moonlight-sdk/arm-webos-linux-gnueabi_sdk-buildroot"
+          test -x "$sdk/relocate-sdk.sh"
+          "$sdk/relocate-sdk.sh"
+          test -f "$sdk/share/buildroot/toolchainfile.cmake"
+
+      - name: Compile patched Moonlight and create IPK
+        shell: bash
+        env:
+          CI: 'true'
+        run: |
+          set -euo pipefail
+          export TOOLCHAIN_FILE="$RUNNER_TEMP/moonlight-sdk/arm-webos-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake"
+          ./scripts/webos/easy_build.sh -DCMAKE_BUILD_TYPE=Release
+
+      - name: Validate and stage IPK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ipk-output
+          count=0
+          while IFS= read -r -d '' ipk; do
+            ar t "$ipk" | grep -q '^data.tar' || { echo "Invalid IPK: $ipk"; exit 1; }
+            cp "$ipk" "ipk-output/$(basename "$ipk")"
+            count=$((count + 1))
+          done < <(find build -type f -name '*.ipk' -print0)
+          test "$count" -gt 0 || { echo 'No .ipk package was produced'; exit 1; }
+          (cd ipk-output && sha256sum -- *.ipk > SHA256SUMS.txt)
+          ls -lah ipk-output
+
+      - name: Upload finished installable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Moonlight-Elite2-webOS26-IPK
+          path: ipk-output/
+          if-no-files-found: error
+          retention-days: 7
