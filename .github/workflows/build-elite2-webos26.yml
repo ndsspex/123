@@ -54,6 +54,25 @@ jobs:
           "$sdk/relocate-sdk.sh"
           test -f "$sdk/share/buildroot/toolchainfile.cmake"
 
+      - name: Install compatible webOS IPK packager (ares-cli-rs 0.7.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='v0.7.0'
+          base="ares-cli-rs-${tag}-linux-x86_64"
+          archive="${base}.tar.gz"
+          url="https://github.com/webosbrew/ares-cli-rs/releases/download/${tag}/${archive}"
+          curl -fL --retry 3 --retry-delay 2 "$url" -o "$RUNNER_TEMP/$archive"
+          curl -fL --retry 3 --retry-delay 2 "${url}.sha256" -o "$RUNNER_TEMP/$archive.sha256"
+          (cd "$RUNNER_TEMP" && sha256sum -c "$archive.sha256")
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/webos-bin"
+          install -m 755 "$RUNNER_TEMP/$base/ares-package" "$RUNNER_TEMP/webos-bin/ares-package"
+          echo "$RUNNER_TEMP/webos-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/webos-bin/ares-package" --help 2>&1 | tee "$RUNNER_TEMP/ares-help.txt"
+          grep -q -- '--force-arch' "$RUNNER_TEMP/ares-help.txt"
+          echo 'webOS ARM packaging tool is available and supports --force-arch.'
+
       - name: Compile patched Moonlight and create IPK
         shell: bash
         env:
@@ -73,8 +92,8 @@ jobs:
             ar t "$ipk" | grep -q '^data.tar' || { echo "Invalid IPK: $ipk"; exit 1; }
             cp "$ipk" "ipk-output/$(basename "$ipk")"
             count=$((count + 1))
-          done < <(find build -type f -name '*.ipk' -print0)
-          test "$count" -gt 0 || { echo 'No .ipk package was produced'; exit 1; }
+          done < <(find dist -maxdepth 1 -type f -name '*.ipk' -print0)
+          test "$count" -gt 0 || { echo 'No .ipk package was produced in dist/'; exit 1; }
           (cd ipk-output && sha256sum -- *.ipk > SHA256SUMS.txt)
           ls -lah ipk-output
 
